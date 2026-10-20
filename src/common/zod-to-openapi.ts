@@ -112,11 +112,11 @@ function buildNumberSchema(schema: z.ZodNumber): SchemaObject {
   for (const check of checks) {
     if (check.kind === 'min') {
       result.minimum = check.value as number;
-      if (check.inclusive === false) result.exclusiveMinimum = check.value as number;
+      if (check.inclusive === false) result.exclusiveMinimum = true;
     }
     if (check.kind === 'max') {
       result.maximum = check.value as number;
-      if (check.inclusive === false) result.exclusiveMaximum = check.value as number;
+      if (check.inclusive === false) result.exclusiveMaximum = true;
     }
     if (check.kind === 'int') result.type = 'integer';
   }

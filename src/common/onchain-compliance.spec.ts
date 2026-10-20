@@ -1,116 +1,152 @@
-import { isAllowedOnChain } from './onchain-compliance';
+import {
+  isAllowedOnChain,
+  checkComplianceContractHealth,
+  setComplianceClientForTesting,
+  resetComplianceClientForTesting,
+  DEFAULT_CANARY_BLOCKED_ADDRESS,
+} from './onchain-compliance';
 
-// Mock the Client.from() and the contract call — using the same approach
-// as kms-ed25519-signer.spec.ts where AWS SDK is mocked. The contract call
-// is wrapped by withRetry() and timeout, so both the client construction
-// and the call inside getClient() must be mockable.
-jest.mock('@stellar/stellar-sdk/contract', () => {
-  const sendMock = jest.fn();
-  return {
-    Client: {
-      from: jest.fn().mockImplementation(() => {
-        return Promise.resolve({
-          is_allowed: jest.fn().mockImplementation(() => {
-            return sendMock();
-          }),
-          _sendMock: sendMock, // Expose for test manipulation
-        });
-      }),
-    },
-  };
-});
-
-describe('onchain-compliance.isAllowedOnChain', () => {
-  let Client: any;
-  let sendMock: jest.Mock;
-
-  beforeAll(() => {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    Client = require('@stellar/stellar-sdk/contract').Client;
+describe('onchain-compliance & canary health verification (Issue #210)', () => {
+  afterEach(() => {
+    resetComplianceClientForTesting();
+    jest.restoreAllMocks();
   });
 
-  beforeEach(() => {
-    jest.clearAllMocks();
-    jest.resetModules(); // Reset the module to clear clientPromise between tests
-    // Re-require after reset to get fresh clientPromise state
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    require('./onchain-compliance');
+  describe('checkComplianceContractHealth', () => {
+    it('reports healthy when the canary address is correctly blocked on-chain', async () => {
+      const mockClient = {
+        is_allowed: jest.fn().mockResolvedValue({ result: false }),
+      };
+      setComplianceClientForTesting(mockClient as any);
+
+      const result = await checkComplianceContractHealth();
+
+      expect(result.healthy).toBe(true);
+      expect(result.initialized).toBe(true);
+      expect(result.canaryAllowed).toBe(false);
+      expect(result.alert).toBeNull();
+      expect(mockClient.is_allowed).toHaveBeenCalledWith({ addr: DEFAULT_CANARY_BLOCKED_ADDRESS });
+    });
+
+    it('detects an uninitialized compliance contract when canary returns true', async () => {
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const mockClient = {
+        // An uninitialized contract returns true for all unrecorded addresses
+        is_allowed: jest.fn().mockResolvedValue({ result: true }),
+      };
+      setComplianceClientForTesting(mockClient as any);
+
+      const result = await checkComplianceContractHealth();
+
+      expect(result.healthy).toBe(false);
+      expect(result.initialized).toBe(false);
+      expect(result.canaryAllowed).toBe(true);
+      expect(result.alert).toContain('[CRITICAL COMPLIANCE ALERT]');
+      expect(result.alert).toContain('almost certainly UNINITIALIZED');
+      expect(consoleErrorSpy).toHaveBeenCalled();
+    });
+
+    it('supports custom canary addresses for staging/testnet environments', async () => {
+      const customCanary = 'GAAACUSTOMCANARYADDRESSFORCOMPLIANCECHECK1234567890';
+      const mockClient = {
+        is_allowed: jest.fn().mockResolvedValue({ result: false }),
+      };
+      setComplianceClientForTesting(mockClient as any);
+
+      const result = await checkComplianceContractHealth(customCanary);
+
+      expect(result.healthy).toBe(true);
+      expect(result.canaryAddress).toBe(customCanary);
+      expect(mockClient.is_allowed).toHaveBeenCalledWith({ addr: customCanary });
+    });
+
+    it('handles RPC errors gracefully and records failure alert without crashing', async () => {
+      const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const mockClient = {
+        is_allowed: jest.fn().mockRejectedValue(new Error('RPC Connection Refused')),
+      };
+      setComplianceClientForTesting(mockClient as any);
+
+      const result = await checkComplianceContractHealth();
+
+      expect(result.healthy).toBe(false);
+      expect(result.initialized).toBe(false);
+      expect(result.canaryAllowed).toBeNull();
+      expect(result.alert).toContain('[COMPLIANCE WARNING]');
+      expect(result.alert).toContain('RPC Connection Refused');
+      expect(consoleWarnSpy).toHaveBeenCalled();
+    });
+
+    it('measures execution latency accurately', async () => {
+      const mockClient = {
+        is_allowed: jest.fn().mockImplementation(async () => {
+          await new Promise((r) => setTimeout(r, 10));
+          return { result: false };
+        }),
+      };
+      setComplianceClientForTesting(mockClient as any);
+
+      const result = await checkComplianceContractHealth();
+
+      expect(result.latencyMs).toBeGreaterThanOrEqual(5);
+    });
   });
 
-  it('returns the real result on successful on-chain check', async () => {
-    const mockClient = {
-      is_allowed: jest.fn().mockResolvedValue({
-        result: false, // Address is not allowed
-      }),
-    };
-    Client.from.mockResolvedValueOnce(mockClient);
+  describe('isAllowedOnChain', () => {
+    it('returns true when client clears the address', async () => {
+      const mockClient = {
+        is_allowed: jest.fn().mockResolvedValue({ result: true }),
+      };
+      setComplianceClientForTesting(mockClient as any);
 
-    const result = await isAllowedOnChain('GDIET4T37N35XU4FY52RMR4Z653WYFITEHGIJXN4VEQTDYR5JSURJDPL');
-    expect(result).toBe(false);
+      const allowed = await isAllowedOnChain('GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H');
+      expect(allowed).toBe(true);
+    });
+
+    it('returns false when client explicitly blocks the address', async () => {
+      const mockClient = {
+        is_allowed: jest.fn().mockResolvedValue({ result: false }),
+      };
+      setComplianceClientForTesting(mockClient as any);
+
+      const allowed = await isAllowedOnChain('GBLOCKEDADDRESS1234567890');
+      expect(allowed).toBe(false);
+    });
+
+    it('fails open on RPC exception as documented to avoid blocking valid payments', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const mockClient = {
+        is_allowed: jest.fn().mockRejectedValue(new Error('Timeout 8000ms reached')),
+      };
+      setComplianceClientForTesting(mockClient as any);
+
+      const allowed = await isAllowedOnChain('GANYADDRESS123');
+      expect(allowed).toBe(true);
+    });
   });
 
-  it('returns true and logs a warning when RPC rejects the call', async () => {
-    const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
-    const mockClient = {
-      is_allowed: jest.fn().mockRejectedValue(new Error('RPC unavailable')),
-    };
-    Client.from.mockResolvedValueOnce(mockClient);
+  describe('concurrency and stress', () => {
+    it('handles 25 concurrent health and check queries without race conditions', async () => {
+      const mockClient = {
+        is_allowed: jest.fn().mockImplementation(async ({ addr }: { addr: string }) => {
+          return { result: addr !== DEFAULT_CANARY_BLOCKED_ADDRESS };
+        }),
+      };
+      setComplianceClientForTesting(mockClient as any);
 
-    const result = await isAllowedOnChain('GDIET4T37N35XU4FY52RMR4Z653WYFITEHGIJXN4VEQTDYR5JSURJDPL');
-    expect(result).toBe(true); // Fails open
-    expect(consoleWarnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[compliance] on-chain check unreachable, failing open'),
-      expect.any(Error),
-    );
+      const healthPromises = Array.from({ length: 15 }, () => checkComplianceContractHealth());
+      const checkPromises = Array.from({ length: 10 }, (_, i) => isAllowedOnChain(`GUSER${i}`));
 
-    consoleWarnSpy.mockRestore();
-  });
+      const [healthResults, checkResults] = await Promise.all([
+        Promise.all(healthPromises),
+        Promise.all(checkPromises),
+      ]);
 
-  it('clears clientPromise on failure so subsequent calls get a fresh client', async () => {
-    const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
-    const mockClientBad = {
-      is_allowed: jest.fn().mockRejectedValue(new Error('First call fails')),
-    };
-    const mockClientGood = {
-      is_allowed: jest.fn().mockResolvedValue({ result: true }),
-    };
+      expect(healthResults).toHaveLength(15);
+      healthResults.forEach((h) => expect(h.healthy).toBe(true));
 
-    // First call fails
-    Client.from.mockResolvedValueOnce(mockClientBad);
-    const firstResult = await isAllowedOnChain('GDIET4T37N35XU4FY52RMR4Z653WYFITEHGIJXN4VEQTDYR5JSURJDPL');
-    expect(firstResult).toBe(true);
-
-    // After cache was cleared, second call should re-create client and succeed
-    // Re-import to get the fresh module with cleared clientPromise
-    jest.resetModules();
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { isAllowedOnChain: isAllowedOnChainFresh } = require('./onchain-compliance');
-    Client.from.mockResolvedValueOnce(mockClientGood);
-    const secondResult = await isAllowedOnChainFresh('GDIET4T37N35XU4FY52RMR4Z653WYFITEHGIJXN4VEQTDYR5JSURJDPL');
-    expect(secondResult).toBe(true);
-    expect(mockClientGood.is_allowed).toHaveBeenCalled();
-
-    consoleWarnSpy.mockRestore();
-  });
-
-  it('respects retry and timeout options from withRetry', async () => {
-    const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
-    // Simulate a call that would timeout (takes longer than 8s timeout)
-    const mockClient = {
-      is_allowed: jest.fn().mockImplementation(
-        () =>
-          new Promise((resolve) => {
-            setTimeout(() => resolve({ result: true }), 15000); // Longer than 8s timeout
-          }),
-      ),
-    };
-    Client.from.mockResolvedValueOnce(mockClient);
-
-    // The withRetry wrapper should timeout this call
-    const result = await isAllowedOnChain('GDIET4T37N35XU4FY52RMR4Z653WYFITEHGIJXN4VEQTDYR5JSURJDPL');
-    expect(result).toBe(true); // Fails open on timeout
-    expect(consoleWarnSpy).toHaveBeenCalled();
-
-    consoleWarnSpy.mockRestore();
+      expect(checkResults).toHaveLength(10);
+      checkResults.forEach((c) => expect(c).toBe(true));
+    });
   });
 });

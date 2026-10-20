@@ -81,3 +81,12 @@ Two findings that change the plan:
 
 Still needed before the real deployer is converted: three signer keys, each held by a different person, and the runbook in [docs/KEYS.md](../KEYS.md) followed on testnet first.
 
+### Post-Deployment Compliance Canary Verification Protocol (Issue #210)
+
+Because Soroban compliance contracts permit permissionless calls to `is_allowed` even when uninitialized (returning `true` for unrecorded keys, konfirm-contracts#189), deployments must always verify contract initialization using a canary address probe:
+
+1. **Seed Canary**: Immediately following the `initialize` call, block the configured canary address (`GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H` or `COMPLIANCE_CANARY_BLOCKED_ADDRESS`).
+2. **Validate Fail-Closed**: Probe `client.is_allowed({ addr: CANARY })` and assert the result is strictly `false`. If the probe returns `true`, the deployment is defective and the contract must not receive production traffic.
+3. **Automated Liveness Monitoring**: The backend's `AdminBlockchainService.status()` and `checkComplianceContractHealth()` continuously verify that the canary returns `false`, producing durable alerts in the dashboard if an uninitialized contract instance is wired into configuration.
+
+

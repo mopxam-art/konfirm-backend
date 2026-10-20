@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { Horizon, rpc } from '@stellar/stellar-sdk';
+import { checkComplianceContractHealth } from '../common/onchain-compliance';
 import { withRetry } from '../common/retry';
 import { HORIZON_URL, RPC_URL } from '../common/stellar-network';
 import { FACILITATOR_ADDRESS, COMPLIANCE_CONTRACT_ID, PAYMENT_CONTRACT_ID, TREASURY_CONTRACT_ID, CHANNEL_CONTRACT_ID } from '../common/stellar-network';
@@ -27,9 +28,10 @@ export class AdminBlockchainService {
   private rpcServer = new rpc.Server(RPC_URL);
 
   async status() {
-    const [facilitatorResult, rpcResult] = await Promise.allSettled([
+    const [facilitatorResult, rpcResult, complianceHealth] = await Promise.allSettled([
       withRetry(() => this.horizon.loadAccount(FACILITATOR_ADDRESS), { retries: 1, timeoutMs: 8_000 }),
       this.pingRpc(),
+      checkComplianceContractHealth(),
     ]);
 
     return {
@@ -47,6 +49,10 @@ export class AdminBlockchainService {
       },
       rpc: rpcResult.status === 'fulfilled' ? rpcResult.value : { reachable: false, latencyMs: null, latestLedger: null },
       contracts: CONTRACTS,
+      complianceHealth:
+        complianceHealth.status === 'fulfilled'
+          ? complianceHealth.value
+          : { healthy: false, initialized: false, alert: 'Health check threw unhandled rejection', canaryAddress: '', canaryAllowed: null, latencyMs: null },
     };
   }
 

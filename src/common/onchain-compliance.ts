@@ -18,6 +18,19 @@ interface ComplianceContract {
   is_allowed(args: { addr: string }, options?: MethodOptions): Promise<AssembledTransaction<boolean>>;
 }
 
+export const DEFAULT_CANARY_BLOCKED_ADDRESS =
+  process.env.COMPLIANCE_CANARY_BLOCKED_ADDRESS ||
+  'GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H';
+
+export interface ComplianceHealthResult {
+  healthy: boolean;
+  initialized: boolean;
+  canaryAddress: string;
+  canaryAllowed: boolean | null;
+  alert: string | null;
+  latencyMs: number | null;
+}
+
 // Constructed once and reused — Client.from() does a real network round
 // trip (fetching the contract's spec) the first time, ~1s; every call
 // after that is a single fast simulate-only RPC round trip (no signing, no
@@ -27,6 +40,15 @@ interface ComplianceContract {
 // future call for the lifetime of the process, since awaiting an
 // already-hung promise a second time doesn't give it a second chance.
 let clientPromise: Promise<Client & ComplianceContract> | null = null;
+
+export function resetComplianceClientForTesting(): void {
+  clientPromise = null;
+}
+
+export function setComplianceClientForTesting(client: (Client & ComplianceContract) | null): void {
+  clientPromise = client ? Promise.resolve(client) : null;
+}
+
 function getClient(): Promise<Client & ComplianceContract> {
   if (!clientPromise) {
     clientPromise = Client.from<ComplianceContract>({
@@ -72,5 +94,68 @@ export async function isAllowedOnChain(address: string): Promise<boolean> {
     console.warn('[compliance] on-chain check unreachable, failing open:', err);
     clientPromise = null;
     return true;
+  }
+}
+
+/**
+ * Health-check probe that detects uninitialized or misconfigured compliance contracts.
+ * Per konfirm-contracts#189, an uninitialized contract permissionlessly returns `true`
+ * for any unrecorded address. By probing a known-blocked canary address, this function
+ * confirms that the contract is actually enforcing its blocklist.
+ */
+export async function checkComplianceContractHealth(
+  canaryAddress = DEFAULT_CANARY_BLOCKED_ADDRESS,
+): Promise<ComplianceHealthResult> {
+  const start = Date.now();
+  try {
+    const tx = await withRetry(
+      async () => {
+        const client = await getClient();
+        return client.is_allowed({ addr: canaryAddress });
+      },
+      { retries: 1, baseDelayMs: 500, timeoutMs: 8_000 },
+    );
+
+    const latencyMs = Date.now() - start;
+    const isAllowed = tx.result;
+
+    if (isAllowed === true) {
+      const alertMsg =
+        `[CRITICAL COMPLIANCE ALERT] Compliance contract (${COMPLIANCE_CONTRACT_ID}) returned allowed=true for known-blocked canary address (${canaryAddress}). ` +
+        `The contract is almost certainly UNINITIALIZED or missing its blocklist! Screening is NOT operating as expected.`;
+      // eslint-disable-next-line no-console
+      console.error(alertMsg);
+      return {
+        healthy: false,
+        initialized: false,
+        canaryAddress,
+        canaryAllowed: true,
+        alert: alertMsg,
+        latencyMs,
+      };
+    }
+
+    return {
+      healthy: true,
+      initialized: true,
+      canaryAddress,
+      canaryAllowed: false,
+      alert: null,
+      latencyMs,
+    };
+  } catch (err) {
+    const latencyMs = Date.now() - start;
+    const alertMsg = `[COMPLIANCE WARNING] Failed to reach compliance contract for health check: ${err instanceof Error ? err.message : String(err)}`;
+    // eslint-disable-next-line no-console
+    console.warn(alertMsg);
+    clientPromise = null;
+    return {
+      healthy: false,
+      initialized: false,
+      canaryAddress,
+      canaryAllowed: null,
+      alert: alertMsg,
+      latencyMs,
+    };
   }
 }
